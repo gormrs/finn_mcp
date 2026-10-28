@@ -1,61 +1,152 @@
 const STREAM_CHUNK = /streamController\.enqueue\(("(?:[^"\\]|\\.)*")\)/g;
 
 // React Router's turbo-stream encoding uses negative indexes for values that
-// have no JSON equivalent. The search payload does not normally contain them,
-// but decoding must not turn them into bogus properties.
+// have no JSON equivalent (see turbo-stream's utils.ts).
+const HOLE = -1;
 const SPECIAL_VALUES = new Map([
-  [-1, undefined],
-  [-2, undefined],
-  [-3, Number.NaN],
-  [-4, Number.POSITIVE_INFINITY],
-  [-5, Number.NEGATIVE_INFINITY],
-  [-6, -0],
-  [-7, null],
+  [-2, Number.NaN],
+  [-3, Number.NEGATIVE_INFINITY],
+  [-4, -0],
+  [-5, null],
+  [-6, Number.POSITIVE_INFINITY],
+  [-7, undefined],
 ]);
 
-function decodeReactRouterStream(html) {
-  const chunks = [];
+const MAX_DEPTH = 1000;
+
+// Each enqueue() call carries a slice of the newline-delimited stream, and a
+// line may be split across calls, so the slices are joined before splitting.
+function readStreamText(html) {
+  let text = "";
   for (const match of html.matchAll(STREAM_CHUNK)) {
     try {
-      // The enqueue argument is a JS string literal containing the JSON
-      // stream, so it needs to be JSON-decoded twice.
       const payload = JSON.parse(match[1]);
-      const values = typeof payload === "string" ? JSON.parse(payload) : payload;
-      if (Array.isArray(values)) chunks.push(...values);
+      if (typeof payload === "string") text += payload;
     } catch {
       // Ignore scripts that are not valid turbo-stream chunks.
     }
   }
-  if (chunks.length === 0) return null;
+  return text;
+}
 
-  const seen = new Map();
+function parseLine(line) {
+  try {
+    return JSON.parse(line);
+  } catch {
+    return undefined;
+  }
+}
+
+function decodeReactRouterStream(html) {
+  const lines = readStreamText(html)
+    .split("\n")
+    .filter((line) => line.trim());
+  if (lines.length === 0) return null;
+
+  const values = [];
+  // Appends a line's values to the shared value table, like turbo-stream's
+  // unflatten(), and returns the index the line's value lives at.
+  const append = (parsed) => {
+    if (typeof parsed === "number") return parsed;
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    const startIndex = values.length;
+    values.push(...parsed);
+    return startIndex;
+  };
+
+  const root = append(parseLine(lines[0]));
+  if (root === null) return null;
+
+  // Later lines settle deferred values: "P<id>:<value>" resolves promise <id>
+  // and "E<id>:<value>" rejects it.
+  const settled = new Map();
+  for (const line of lines.slice(1)) {
+    const match = /^([PE])(\d+):(.*)$/s.exec(line);
+    if (!match) continue;
+    const index = append(parseLine(match[3]));
+    if (index !== null) settled.set(Number(match[2]), { rejected: match[1] === "E", index });
+  }
+
+  const hydrated = new Map();
   const hydrate = (index, depth = 0) => {
-    if (index < 0) return SPECIAL_VALUES.get(index);
-    if (depth > 200) return null;
-    if (seen.has(index)) return seen.get(index);
+    if (SPECIAL_VALUES.has(index)) return SPECIAL_VALUES.get(index);
+    if (depth > MAX_DEPTH) throw new Error("Cannot parse FINN eiendom search: stream data is nested too deeply");
+    if (hydrated.has(index)) return hydrated.get(index);
 
-    const value = chunks[index];
+    const value = values[index];
     if (value === null || typeof value !== "object") return value;
 
     if (Array.isArray(value)) {
+      if (typeof value[0] === "string") return hydrateTyped(index, value, depth);
       const array = [];
-      seen.set(index, array);
-      for (const entry of value) array.push(hydrate(entry, depth + 1));
+      hydrated.set(index, array);
+      value.forEach((entry, i) => {
+        if (entry !== HOLE) array[i] = hydrate(entry, depth + 1);
+      });
       return array;
     }
 
     const object = {};
-    seen.set(index, object);
+    hydrated.set(index, object);
     for (const [key, entry] of Object.entries(value)) {
       // Turbo-stream objects are maps from encoded key indexes to value
       // indexes, for example { "_1": 2, "_3": -7 }.
-      const property = key.startsWith("_") ? hydrate(Number(key.slice(1)), depth + 1) : key;
-      object[String(property)] = hydrate(entry, depth + 1);
+      object[String(hydrate(Number(key.slice(1)), depth + 1))] = hydrate(entry, depth + 1);
     }
     return object;
   };
 
-  return hydrate(0);
+  // Typed values are encoded as ["<tag>", ...]. They are decoded to plain
+  // JSON-friendly values, since the result is serialised for tool output.
+  const hydrateTyped = (index, [type, b, c], depth) => {
+    const set = (result) => {
+      hydrated.set(index, result);
+      return result;
+    };
+    const rest = values[index].slice(1);
+    switch (type) {
+      case "D":
+        return set(b);
+      case "U":
+      case "B":
+      case "Y":
+        return set(String(b));
+      case "R":
+        return set(String(new RegExp(b, c)));
+      case "E":
+        return set({ error: String(b) });
+      case "S":
+        return set(rest.map((entry) => hydrate(entry, depth + 1)));
+      case "M": {
+        const object = set({});
+        for (let i = 0; i + 1 < rest.length; i += 2) {
+          object[String(hydrate(rest[i], depth + 1))] = hydrate(rest[i + 1], depth + 1);
+        }
+        return object;
+      }
+      case "N": {
+        const object = set({});
+        for (const [key, entry] of Object.entries(b ?? {})) {
+          object[String(hydrate(Number(key.slice(1)), depth + 1))] = hydrate(entry, depth + 1);
+        }
+        return object;
+      }
+      case "P": {
+        // Deferred data is resolved in place; an unsettled or rejected
+        // promise has no usable value.
+        const result = settled.get(b);
+        if (!result || result.rejected) return set(null);
+        hydrated.set(index, null);
+        return set(hydrate(result.index, depth + 1));
+      }
+      case "Z":
+        return set(hydrate(b, depth + 1));
+      default:
+        return set(null);
+    }
+  };
+
+  return hydrate(root);
 }
 
 export function extractEiendomSearchData(html) {
@@ -123,7 +214,7 @@ function formatPublished(value) {
 
 function mapEiendomDoc(doc) {
   return {
-    finn_code: String(doc.ad_id ?? doc.id),
+    finn_code: doc.ad_id != null || doc.id != null ? String(doc.ad_id ?? doc.id) : null,
     heading: doc.heading ?? null,
     location: doc.location ?? null,
     local_area: doc.local_area_name ?? null,

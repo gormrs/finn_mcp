@@ -134,3 +134,49 @@ test("search_finn_eiendom supports subverticals and reports upstream failures", 
   assert.equal(malformed.isError, true);
   assert.match(malformed.content[0].text, /Cannot parse FINN eiendom search/);
 });
+
+// A hand-encoded turbo-stream payload: nulls (-5), undefined (-7), a URL value,
+// search results deferred behind a promise, and a doc without an id.
+function syntheticStreamHtml() {
+  const root = [{ _1: 2 }, "loaderData", { _3: 4 }, "routes/realestate/search/search", { _5: 6 }, "results", ["P", 1]];
+  const results = [
+    { _8: 9, _10: 11 },
+    "docs",
+    [17, 24],
+    "metadata",
+    { _12: 13 },
+    "result_size",
+    { _14: 15 },
+    "match_count",
+    2,
+    "ad_id",
+    { _16: 18, _19: -5, _20: -5, _21: 22, _23: -7 },
+    123,
+    "organisation_name",
+    "owner_type_description",
+    "canonical_url",
+    ["U", "https://www.finn.no/realestate/homes/ad.html?finnkode=123"],
+    "number_of_bedrooms",
+    {},
+  ];
+  const stream = `${JSON.stringify(root)}\nP1:${JSON.stringify(results)}\n`;
+  // Split mid-line to check that chunks spanning enqueue() calls are joined.
+  const cut = Math.floor(stream.length / 2);
+  return [stream.slice(0, cut), stream.slice(cut)]
+    .map((part) => `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(part)});</script>`)
+    .join("");
+}
+
+test("eiendom stream decoding handles nulls, typed values, deferred data and split chunks", () => {
+  const page = parseEiendomSearchPage(syntheticStreamHtml());
+  assert.equal(page.total_results, 2);
+  assert.equal(page.results.length, 2);
+
+  const [first, second] = page.results;
+  assert.equal(first.finn_code, "123");
+  assert.equal(first.broker, null);
+  assert.equal(first.ownership_type, null);
+  assert.equal(first.bedrooms, null);
+  assert.equal(first.url, "https://www.finn.no/realestate/homes/ad.html?finnkode=123");
+  assert.equal(second.finn_code, null);
+});
